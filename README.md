@@ -2,4 +2,4 @@
 
 ![crates-io version](https://raster.shields.io/crates/v/stormcell.png)
 
-Hierarchical grid processing toolkit
+Hierarchical grid processing for simulations
