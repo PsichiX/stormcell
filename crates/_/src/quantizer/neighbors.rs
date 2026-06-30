@@ -1,21 +1,32 @@
 use crate::{
     allocator::Address,
-    grid::CellData,
     quantizer::{CellContext, Quantizer},
+    topology::Topology,
 };
 
-pub struct NeighborsQuantizer<Q: Quantizer<CellData = T>, T: CellData> {
+/// Adapter that matches each cell's resolution to that of its neighbourhood
+/// before delegating to the wrapped quantizer.
+///
+/// Before processing a cell it inspects the surrounding region (the cell grown
+/// by [`tile_margin`](NeighborsQuantizer::tile_margin) on every side) and
+/// subdivides down to the finest depth found there, so rules that read
+/// neighbours aren't starved of detail across a coarse/fine boundary.
+pub struct NeighborsQuantizer<Q> {
+    /// How far, in cells, to look past the cell's own bounds when measuring the
+    /// neighbourhood's resolution (clamped to at least `1`).
     pub tile_margin: usize,
+    /// The inner per-cell quantizer.
     pub quantizer: Q,
 }
 
-impl<Q: Quantizer<CellData = T>, T: CellData> NeighborsQuantizer<Q, T> {
-    fn subquantize(&self, mut context: CellContext<T>, desired_depth: usize) -> Address {
+impl<Q: Quantizer> NeighborsQuantizer<Q> {
+    fn subquantize(
+        &self,
+        mut context: CellContext<Q::CellData, Q::Topology>,
+        desired_depth: usize,
+    ) -> Address {
         if context.depth < desired_depth {
-            let children = context.subdivide_region().map(|subregion| {
-                let context = unsafe { context.subregion(&subregion) };
-                self.subquantize(context, desired_depth)
-            });
+            let children = context.subdivide(|ctx| self.subquantize(ctx, desired_depth));
             context
                 .emitter
                 .emit_branch_possibly_merged(children, |cells| self.quantizer.merge(cells))
@@ -25,19 +36,21 @@ impl<Q: Quantizer<CellData = T>, T: CellData> NeighborsQuantizer<Q, T> {
     }
 }
 
-impl<Q: Quantizer<CellData = T>, T: CellData> Quantizer for NeighborsQuantizer<Q, T> {
-    type CellData = T;
+impl<Q: Quantizer> Quantizer for NeighborsQuantizer<Q> {
+    type CellData = Q::CellData;
+    type Topology = Q::Topology;
 
-    fn quantize(&self, context: CellContext<Self::CellData>) -> Address {
+    fn quantize(&self, context: CellContext<Self::CellData, Self::Topology>) -> Address {
         if context.depth >= context.sampler.grid_config().chunk_max_depth {
             return self.quantizer.quantize(context);
         }
         let margin = self.tile_margin.max(1);
-        let coords_from = context
-            .region
-            .start
-            .map(|coord| coord.saturating_sub(margin));
-        let coords_to = context.region.end.map(|coord| coord.saturating_add(margin));
+        let coords_from = <Q::Topology as Topology>::map(context.region.start, |coord| {
+            coord.saturating_sub(margin)
+        });
+        let coords_to = <Q::Topology as Topology>::map(context.region.end, |coord| {
+            coord.saturating_add(margin)
+        });
         let desired_depth = context
             .sampler
             .region_granularity_depth(coords_from..coords_to)
@@ -45,7 +58,7 @@ impl<Q: Quantizer<CellData = T>, T: CellData> Quantizer for NeighborsQuantizer<Q
         self.subquantize(context, desired_depth)
     }
 
-    fn merge(&self, cells: [&Self::CellData; 8]) -> Self::CellData {
+    fn merge(&self, cells: &[&Self::CellData]) -> Self::CellData {
         self.quantizer.merge(cells)
     }
 }
@@ -55,8 +68,9 @@ mod tests {
     use super::*;
     use crate::{
         changes::Changes,
-        grid::{Grid, GridConfig},
+        grid::{CellData, Grid3d, GridConfig},
         pipeline::Transformer,
+        topology::Topology3d,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,8 +98,9 @@ mod tests {
 
     impl Quantizer for Contamination {
         type CellData = Virus;
+        type Topology = Topology3d;
 
-        fn quantize(&self, context: CellContext<Self::CellData>) -> Address {
+        fn quantize(&self, context: CellContext<Self::CellData, Self::Topology>) -> Address {
             let from = context.region.start.map(|coord| coord.saturating_sub(1));
             let to = context.region.end.map(|coord| coord.saturating_add(1));
             let value = context
@@ -104,7 +119,7 @@ mod tests {
             quantizer: Contamination,
         };
 
-        let mut grid = Grid::new(
+        let mut grid = Grid3d::new(
             GridConfig {
                 chunk_max_depth: 2,
                 sampler_cache_limit: Some(64),

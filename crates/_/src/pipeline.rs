@@ -1,18 +1,31 @@
 use crate::{
     allocator::{Address, Allocator},
     grid::{Cell, CellData, Grid, GridSampler},
-    quantizer::{CELL_CHILDREN_INDICES, COORD_INDICES, CellContext, CellEmitter, Quantizer},
+    quantizer::{CellContext, CellEmitter, Quantizer},
+    topology::Topology,
 };
 use std::ops::Range;
 
-pub struct Transformer<'a, T: CellData> {
+/// Runs a [`Quantizer`] over an entire grid to produce a new grid.
+///
+/// The transformer walks every chunk of the source `grid`, invoking the
+/// quantizer per cell and assembling the results into a freshly-allocated
+/// destination grid (same config and dimensions). The source grid is read-only;
+/// nothing is mutated in place.
+pub struct Transformer<'a, T: CellData, Topo: Topology> {
+    /// Depth interval at which the source sampler's leaf cache is trimmed during
+    /// the walk, bounding peak cache size on deep trees.
     pub cached_samples_evicting_depth: usize,
-    quantizer: &'a dyn Quantizer<CellData = T>,
-    grid: &'a Grid<T>,
+    quantizer: &'a dyn Quantizer<CellData = T, Topology = Topo>,
+    grid: &'a Grid<T, Topo>,
 }
 
-impl<'a, T: CellData> Transformer<'a, T> {
-    pub fn new(quantizer: &'a dyn Quantizer<CellData = T>, grid: &'a Grid<T>) -> Self {
+impl<'a, T: CellData, Topo: Topology> Transformer<'a, T, Topo> {
+    /// Creates a transformer pairing `quantizer` with the source `grid`.
+    pub fn new(
+        quantizer: &'a dyn Quantizer<CellData = T, Topology = Topo>,
+        grid: &'a Grid<T, Topo>,
+    ) -> Self {
         Self {
             cached_samples_evicting_depth: 4,
             quantizer,
@@ -20,12 +33,14 @@ impl<'a, T: CellData> Transformer<'a, T> {
         }
     }
 
+    /// Overrides [`cached_samples_evicting_depth`](Transformer::cached_samples_evicting_depth).
     pub fn with_cached_samples_evicting_depth(mut self, value: usize) -> Self {
         self.cached_samples_evicting_depth = value;
         self
     }
 
-    pub fn execute(self) -> Grid<T> {
+    /// Runs the quantizer over the whole grid and returns the new grid.
+    pub fn execute(self) -> Grid<T, Topo> {
         let Self {
             cached_samples_evicting_depth,
             quantizer,
@@ -43,13 +58,9 @@ impl<'a, T: CellData> Transformer<'a, T> {
                     .allocator
                     .read(address)
                     .unwrap_or_else(|| panic!("Could not read cell at address: {}", address));
-                let chunk_coords = [
-                    index % grid.config.chunks_num[0],
-                    (index / grid.config.chunks_num[0]) % grid.config.chunks_num[1],
-                    index / (grid.config.chunks_num[0] * grid.config.chunks_num[1]),
-                ];
-                let coords_from = chunk_coords.map(|coord| coord * grid.chunk_size);
-                let coords_to = coords_from.map(|coord| coord + grid.chunk_size);
+                let chunk_coords = Topo::from_linear_index(index, grid.config.chunks_num);
+                let coords_from = Topo::map(chunk_coords, |coord| coord * grid.chunk_size);
+                let coords_to = Topo::map(coords_from, |coord| coord + grid.chunk_size);
                 Self::process_cell(
                     coords_from..coords_to,
                     grid.chunk_size,
@@ -73,14 +84,14 @@ impl<'a, T: CellData> Transformer<'a, T> {
 
     #[allow(clippy::too_many_arguments)]
     fn process_cell(
-        region: Range<[usize; 3]>,
+        region: Range<Topo::Coord>,
         cell_size: usize,
         depth: usize,
         cached_samples_evicting_depth: usize,
-        cell: &Cell<T>,
-        quantizer: &dyn Quantizer<CellData = T>,
-        sampler: &mut GridSampler<T>,
-        allocator: &mut Allocator<Cell<T>>,
+        cell: &Cell<T, Topo>,
+        quantizer: &dyn Quantizer<CellData = T, Topology = Topo>,
+        sampler: &mut GridSampler<T, Topo>,
+        allocator: &mut Allocator<Cell<T, Topo>>,
     ) -> Address {
         match cell {
             Cell::Leaf { data } => {
@@ -95,16 +106,20 @@ impl<'a, T: CellData> Transformer<'a, T> {
                 })
             }
             Cell::Branch { children } => {
-                let region_half_size =
-                    COORD_INDICES.map(|index| (region.end[index] - region.start[index]) / 2);
-                let children = CELL_CHILDREN_INDICES.map(|index| {
-                    let address = children[index];
-                    let child_coords = [index & 1, (index >> 1) & 1, (index >> 2) & 1];
-                    let coords_from = COORD_INDICES.map(|index| {
-                        region.start[index] + region_half_size[index] * child_coords[index]
+                let region_half_size = Topo::from_axes(|axis| {
+                    (Topo::axis(region.end, axis) - Topo::axis(region.start, axis)) / 2
+                });
+                let children = Topo::children_from_fn(|index| {
+                    let address = Topo::children_as_slice(children)[index];
+                    let child_coords = Topo::child_offset(index);
+                    let coords_from = Topo::from_axes(|axis| {
+                        Topo::axis(region.start, axis)
+                            + Topo::axis(region_half_size, axis) * Topo::axis(child_coords, axis)
                     });
-                    let coords_to = COORD_INDICES.map(|index| {
-                        region.start[index] + region_half_size[index] * (child_coords[index] + 1)
+                    let coords_to = Topo::from_axes(|axis| {
+                        Topo::axis(region.start, axis)
+                            + Topo::axis(region_half_size, axis)
+                                * (Topo::axis(child_coords, axis) + 1)
                     });
                     Self::process_cell(
                         coords_from..coords_to,
@@ -119,27 +134,32 @@ impl<'a, T: CellData> Transformer<'a, T> {
                         allocator,
                     )
                 });
-                let cells = children.map(|address| {
-                    allocator
-                        .read(address)
-                        .unwrap_or_else(|| panic!("Could not read cell at address: {}", address))
-                });
+                let cells = Topo::children_as_slice(&children)
+                    .iter()
+                    .map(|&address| {
+                        *allocator.read(address).unwrap_or_else(|| {
+                            panic!("Could not read cell at address: {}", address)
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 if cells.iter().all(|cell| cell.is_leaf()) {
-                    let cells_data =
-                        cells.map(|cell| cell.data().expect("Could not read cell data"));
+                    let cells_data = cells
+                        .iter()
+                        .map(|cell| cell.data().expect("Could not read cell data"))
+                        .collect::<Vec<_>>();
                     if cells_data
                         .iter()
                         .skip(1)
                         .all(|data| cells_data[0].are_homogeneous(data))
                     {
-                        let merged_data = quantizer.merge(cells_data);
-                        for _ in 0..8 {
+                        let merged_data = quantizer.merge(&cells_data);
+                        for _ in 0..Topo::CHILDREN {
                             allocator.pop();
                         }
                         return allocator.push(Cell::Leaf { data: merged_data });
                     }
                 }
-                if depth % cached_samples_evicting_depth == 0 {
+                if depth.is_multiple_of(cached_samples_evicting_depth) {
                     sampler.evict_least_accessed_samples();
                 }
                 allocator.push(Cell::Branch { children })

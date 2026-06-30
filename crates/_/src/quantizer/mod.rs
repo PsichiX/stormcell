@@ -1,57 +1,66 @@
+/// Forces a quantizer to run at unit resolution.
 pub mod kernel;
+/// Matches a cell's resolution to its neighbourhood.
 pub mod neighbors;
 
 use crate::{
     allocator::{Address, Allocator},
     grid::{Cell, CellData, GridSampler},
+    topology::Topology,
 };
 use std::ops::Range;
 
-pub const COORD_INDICES: [usize; 3] = [0, 1, 2];
-pub const CELL_CHILDREN_INDICES: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-pub const CELL_CHILDREN_COORDS: [[usize; 3]; 8] = [
-    [0, 0, 0],
-    [1, 0, 0],
-    [0, 1, 0],
-    [1, 1, 0],
-    [0, 0, 1],
-    [1, 0, 1],
-    [0, 1, 1],
-    [1, 1, 1],
-];
-
-pub struct CellEmitter<'a, T: CellData> {
-    pub(crate) allocator: &'a mut Allocator<Cell<T>>,
+/// Writes new cells into the destination arena while a [`Quantizer`] runs.
+///
+/// A quantizer is handed an emitter and must return exactly one [`Address`] - the
+/// root of the (sub)tree it produced for its cell - built via these methods.
+pub struct CellEmitter<'a, T: CellData, Topo: Topology> {
+    pub(crate) allocator: &'a mut Allocator<Cell<T, Topo>>,
 }
 
-impl<'a, T: CellData> CellEmitter<'a, T> {
+impl<'a, T: CellData, Topo: Topology> CellEmitter<'a, T, Topo> {
+    /// Emits a leaf holding `data` and returns its address.
     pub fn emit_leaf(&mut self, data: T) -> Address {
         self.allocator.push(Cell::Leaf { data })
     }
 
-    pub fn emit_branch(&mut self, children: [Address; 8]) -> Address {
+    /// Emits a branch with the given child addresses and returns its address.
+    pub fn emit_branch(&mut self, children: Topo::Children<Address>) -> Address {
         self.allocator.push(Cell::Branch { children })
     }
 
+    /// Emits a branch, but collapses it back into a single leaf when all
+    /// children are [homogeneous](CellData::are_homogeneous) leaves.
+    ///
+    /// `merger` combines the children's data into the merged leaf's value and is
+    /// only called when the merge actually happens. Maintains the
+    /// "no branch that could be a leaf" invariant.
     pub fn emit_branch_possibly_merged(
         &mut self,
-        children: [Address; 8],
-        merger: impl Fn([&T; 8]) -> T,
+        children: Topo::Children<Address>,
+        merger: impl Fn(&[&T]) -> T,
     ) -> Address {
-        let cells = children.map(|address| {
-            self.allocator
-                .read(address)
-                .unwrap_or_else(|| panic!("Could not read cell at address: {}", address))
-        });
+        let cells = Topo::children_as_slice(&children)
+            .iter()
+            .map(|&address| {
+                *self
+                    .allocator
+                    .read(address)
+                    .unwrap_or_else(|| panic!("Could not read cell at address: {}", address))
+            })
+            .collect::<Vec<_>>();
         if cells.iter().all(|cell| cell.is_leaf()) {
-            let cells_data = cells.map(|cell| cell.data().expect("Could not read cell data"));
+            let cells_data = cells
+                .iter()
+                .map(|cell| cell.data().expect("Could not read cell data"))
+                .collect::<Vec<_>>();
             if cells_data
                 .iter()
                 .skip(1)
                 .all(|data| cells_data[0].are_homogeneous(data))
             {
-                let merged_data = merger(cells_data);
-                for _ in 0..8 {
+                let merged_data = merger(&cells_data);
+                for _ in 0..Topo::CHILDREN {
                     self.allocator.pop();
                 }
                 return self.allocator.push(Cell::Leaf { data: merged_data });
@@ -60,59 +69,94 @@ impl<'a, T: CellData> CellEmitter<'a, T> {
         self.allocator.push(Cell::Branch { children })
     }
 
-    pub fn emit_group(&mut self, f: impl FnOnce(&mut Self) -> [Address; 8]) -> Address {
+    /// Convenience wrapper around [`emit_branch`](CellEmitter::emit_branch) that
+    /// builds the children via `f` first.
+    pub fn emit_group(&mut self, f: impl FnOnce(&mut Self) -> Topo::Children<Address>) -> Address {
         let children = f(self);
         self.emit_branch(children)
     }
 
+    /// Convenience wrapper around
+    /// [`emit_branch_possibly_merged`](CellEmitter::emit_branch_possibly_merged)
+    /// that builds the children via `f` first.
     pub fn emit_group_possibly_merged(
         &mut self,
-        f: impl FnOnce(&mut Self) -> [Address; 8],
-        merger: impl Fn([&T; 8]) -> T,
+        f: impl FnOnce(&mut Self) -> Topo::Children<Address>,
+        merger: impl Fn(&[&T]) -> T,
     ) -> Address {
         let children = f(self);
         self.emit_branch_possibly_merged(children, merger)
     }
 }
 
-pub struct CellContext<'a, T: CellData> {
-    pub region: Range<[usize; 3]>,
+/// The cell currently being processed by a [`Quantizer`], plus everything
+/// needed to read neighbours and emit the replacement cell.
+pub struct CellContext<'a, T: CellData, Topo: Topology> {
+    /// Half-open region of grid coordinates this cell covers.
+    pub region: Range<Topo::Coord>,
+    /// Edge length of this cell in cells (`chunk_size >> depth`).
     pub cell_size: usize,
+    /// Depth of this cell below its chunk root (`0` = whole chunk).
     pub depth: usize,
+    /// This cell's current data value.
     pub cell_data: &'a T,
-    pub sampler: &'a mut GridSampler<'a, T>,
-    pub emitter: &'a mut CellEmitter<'a, T>,
+    /// Sampler over the *source* grid, for reading neighbours.
+    pub sampler: &'a mut GridSampler<'a, T, Topo>,
+    /// Emitter into the *destination* grid, for writing the replacement cell.
+    pub emitter: &'a mut CellEmitter<'a, T, Topo>,
 }
 
-impl<'a, T: CellData> CellContext<'a, T> {
+impl<'a, T: CellData, Topo: Topology> CellContext<'a, T, Topo> {
+    /// The edge length of a cell at this depth (`chunk_size >> depth`),
+    /// equivalently [`cell_size`](CellContext::cell_size).
     pub fn depth_size(&self) -> usize {
-        1 >> self.depth
+        self.sampler.grid_chunk_size() >> self.depth
     }
 
+    /// Number of unit cells this cell covers (`cell_size.pow(DIMENSIONS)`).
     pub fn area(&self) -> usize {
-        self.cell_size * self.cell_size * self.cell_size
+        Topo::cell_volume(self.cell_size)
     }
 
-    pub fn subdivide_region(&self) -> [ContextSubRegion; 8] {
-        let region_half_size =
-            COORD_INDICES.map(|index| (self.region.end[index] - self.region.start[index]) / 2);
-        let cell_size = self.cell_size / 2;
-        let depth = self.depth + 1;
-        CELL_CHILDREN_INDICES.map(move |index| {
-            let child_coords = [index & 1, (index >> 1) & 1, (index >> 2) & 1];
-            let coords_from = COORD_INDICES.map(|index| {
-                self.region.start[index] + region_half_size[index] * child_coords[index]
-            });
-            let coords_to = COORD_INDICES.map(|index| {
-                self.region.start[index] + region_half_size[index] * (child_coords[index] + 1)
-            });
-            ContextSubRegion {
-                index,
-                region_coord: child_coords,
-                region: coords_from..coords_to,
-                cell_size,
-                depth,
-            }
+    /// Compute the descriptor of the `index`-th child subregion.
+    pub fn subregion_at(&self, index: usize) -> ContextSubRegion<Topo> {
+        let region_coord = Topo::child_offset(index);
+        let coords_from = Topo::from_axes(|axis| {
+            let start = Topo::axis(self.region.start, axis);
+            let half = (Topo::axis(self.region.end, axis) - start) / 2;
+            start + half * Topo::axis(region_coord, axis)
+        });
+        let coords_to = Topo::from_axes(|axis| {
+            let start = Topo::axis(self.region.start, axis);
+            let half = (Topo::axis(self.region.end, axis) - start) / 2;
+            start + half * (Topo::axis(region_coord, axis) + 1)
+        });
+        ContextSubRegion {
+            index,
+            region_coord,
+            region: coords_from..coords_to,
+            cell_size: self.cell_size / 2,
+            depth: self.depth + 1,
+        }
+    }
+
+    /// All child subregions of this cell, in child-index order.
+    pub fn subdivide_region(&self) -> Vec<ContextSubRegion<Topo>> {
+        (0..Topo::CHILDREN)
+            .map(|index| self.subregion_at(index))
+            .collect()
+    }
+
+    /// Subdivide this cell, invoking `f` with a child context per slot and
+    /// collecting the emitted addresses into a topology-shaped children array.
+    pub fn subdivide(
+        &mut self,
+        mut f: impl FnMut(CellContext<T, Topo>) -> Address,
+    ) -> Topo::Children<Address> {
+        Topo::children_from_fn(|index| {
+            let subregion = self.subregion_at(index);
+            let context = unsafe { self.subregion(&subregion) };
+            f(context)
         })
     }
 
@@ -122,7 +166,7 @@ impl<'a, T: CellData> CellContext<'a, T> {
     /// behavior if not cerefully used, as the emitter and sampler may be
     /// modified while it is being used in another context.
     /// Please ensure proper emitter and sampler usage.
-    pub unsafe fn subregion(&mut self, subregion: &ContextSubRegion) -> Self {
+    pub unsafe fn subregion(&mut self, subregion: &ContextSubRegion<Topo>) -> Self {
         CellContext {
             region: subregion.region.clone(),
             cell_size: subregion.cell_size,
@@ -134,21 +178,41 @@ impl<'a, T: CellData> CellContext<'a, T> {
     }
 }
 
+/// Describes one child slot when subdividing a [`CellContext`].
 #[derive(Debug, Clone)]
-pub struct ContextSubRegion {
+pub struct ContextSubRegion<Topo: Topology> {
+    /// Child index within the parent (`0..CHILDREN`).
     pub index: usize,
-    pub region_coord: [usize; 3],
-    pub region: Range<[usize; 3]>,
+    /// The child's `0`/`1`-per-axis offset within the parent.
+    pub region_coord: Topo::Coord,
+    /// Half-open region of grid coordinates the child covers.
+    pub region: Range<Topo::Coord>,
+    /// Edge length of the child cell in cells (half the parent's).
     pub cell_size: usize,
+    /// Depth of the child (one deeper than the parent).
     pub depth: usize,
 }
 
+/// A transformation rule applied to a grid, cell by cell, by a
+/// [`Transformer`](crate::pipeline::Transformer).
+///
+/// For each cell of the source grid, [`quantize`](Quantizer::quantize) decides
+/// what to emit into the destination grid: a leaf, or a branch built by
+/// [subdividing](CellContext::subdivide) and recursing. Implementors may read
+/// neighbouring cells through [`CellContext::sampler`].
 pub trait Quantizer {
+    /// The cell value type this quantizer operates on.
     type CellData: CellData;
+    /// The grid topology this quantizer operates on.
+    type Topology: Topology;
 
-    fn quantize(&self, context: CellContext<Self::CellData>) -> Address;
+    /// Produces the replacement (sub)tree for one source cell, returning the
+    /// address of its root in the destination arena.
+    fn quantize(&self, context: CellContext<Self::CellData, Self::Topology>) -> Address;
 
-    fn merge(&self, cells: [&Self::CellData; 8]) -> Self::CellData {
+    /// Combines the data of `CHILDREN` homogeneous leaves into the single value
+    /// they collapse to. `cells` is non-empty; the default keeps the first.
+    fn merge(&self, cells: &[&Self::CellData]) -> Self::CellData {
         *cells[0]
     }
 }
@@ -158,8 +222,9 @@ mod tests {
     use super::*;
     use crate::{
         changes::Changes,
-        grid::{Grid, GridConfig},
+        grid::{Grid3d, GridConfig},
         pipeline::Transformer,
+        topology::Topology3d,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -181,8 +246,9 @@ mod tests {
 
     impl Quantizer for Decay {
         type CellData = Stability;
+        type Topology = Topology3d;
 
-        fn quantize(&self, context: CellContext<Self::CellData>) -> Address {
+        fn quantize(&self, context: CellContext<Self::CellData, Self::Topology>) -> Address {
             let value = context.cell_data.0.saturating_sub(self.rate);
 
             context.emitter.emit_leaf(Stability(value))
@@ -204,7 +270,7 @@ mod tests {
     fn test_quantizer() {
         let quantizer = Decay { rate: 1 };
 
-        let mut grid = Grid::new(
+        let mut grid = Grid3d::new(
             GridConfig {
                 chunk_max_depth: 2,
                 sampler_cache_limit: Some(64),

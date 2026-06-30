@@ -1,9 +1,9 @@
 [package]
 name = "stormcell"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Patryk 'PsichiX' Budzynski <psichix@gmail.com>"]
-description = "Hierarchical grid processing for simulations"
+description = "Adaptive Resolution Grid processing for simulations"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/PsichiX/stormcell"
 repository = "https://github.com/PsichiX/stormcell"

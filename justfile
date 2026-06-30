@@ -24,6 +24,9 @@ checks:
   just test
   # just miri
 
+example:
+  cargo run --example heat_diffusion_2d --manifest-path ./crates/_/Cargo.toml
+
 clean:
   find . -name target -type d -exec rm -r {} +
   just remove-lockfiles

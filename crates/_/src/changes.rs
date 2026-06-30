@@ -3,21 +3,31 @@ use crate::{
     grid::{CellData, Grid},
     pipeline::Transformer,
     quantizer::{CellContext, Quantizer},
+    topology::{Topology, Topology3d},
 };
 use std::{collections::BTreeMap, ops::Range};
 
-pub struct Changes<T: CellData> {
+/// A sparse staging buffer of pending cell edits.
+///
+/// Edits are accumulated by coordinate and only materialised when
+/// [`apply`](Changes::apply)ed to a grid. `Changes` is itself a
+/// [`Quantizer`]: applying it rebuilds the grid, subdividing only where edits
+/// introduce heterogeneity and leaving untouched regions coarse. Edits are
+/// bucketed into cubic chunks of `chunk_size` (independent of the target grid's
+/// own chunking) to keep the backing map compact.
+pub struct Changes<T: CellData, Topo: Topology = Topology3d> {
     chunk_size: usize,
-    chunks: BTreeMap<[usize; 3], Vec<Option<T>>>,
+    chunks: BTreeMap<Topo::Coord, Vec<Option<T>>>,
 }
 
-impl<T: CellData> Default for Changes<T> {
+impl<T: CellData, Topo: Topology> Default for Changes<T, Topo> {
     fn default() -> Self {
         Self::new(32)
     }
 }
 
-impl<T: CellData> Changes<T> {
+impl<T: CellData, Topo: Topology> Changes<T, Topo> {
+    /// Creates an empty change set bucketing edits into cubes of `chunk_size`.
     #[inline]
     pub fn new(chunk_size: usize) -> Self {
         Self {
@@ -26,97 +36,115 @@ impl<T: CellData> Changes<T> {
         }
     }
 
+    /// The edit-bucket edge length this change set uses.
     #[inline]
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
     }
 
+    /// Discards all pending edits.
     #[inline]
     pub fn clear(&mut self) {
         self.chunks.clear();
     }
 
-    pub fn set(&mut self, coord: [usize; 3], value: T) {
-        let chunk_coord = coord.map(|c| c / self.chunk_size);
-        let local_coord = coord.map(|c| c % self.chunk_size);
-        let index = local_coord[0] * self.chunk_size * self.chunk_size
-            + local_coord[1] * self.chunk_size
-            + local_coord[2];
+    fn local_index(&self, local_coord: Topo::Coord) -> usize {
+        Topo::linear_index(local_coord, Topo::splat(self.chunk_size))
+    }
+
+    /// Stages `value` at a single `coord`, overwriting any prior edit there.
+    pub fn set(&mut self, coord: Topo::Coord, value: T) {
+        let chunk_coord = Topo::map(coord, |c| c / self.chunk_size);
+        let local_coord = Topo::map(coord, |c| c % self.chunk_size);
+        let index = self.local_index(local_coord);
+        let capacity = Topo::cell_volume(self.chunk_size);
         let chunk = self
             .chunks
             .entry(chunk_coord)
-            .or_insert_with(|| vec![None; self.chunk_size * self.chunk_size * self.chunk_size])
+            .or_insert_with(|| vec![None; capacity])
             .as_mut_slice();
         chunk[index] = Some(value);
     }
 
-    pub fn set_region(&mut self, region: Range<[usize; 3]>, value: T) {
-        for coord in (region.start[0]..region.end[0])
-            .flat_map(move |x| (region.start[1]..region.end[1]).map(move |y| [x, y]))
-            .flat_map(move |[x, y]| (region.start[2]..region.end[2]).map(move |z| ([x, y, z])))
-        {
+    /// Stages `value` at every coordinate in the half-open `region`.
+    pub fn set_region(&mut self, region: Range<Topo::Coord>, value: T) {
+        let mut coords = Vec::new();
+        Topo::for_each_coord(&region, |coord| coords.push(coord));
+        for coord in coords {
             self.set(coord, value);
         }
     }
 
-    pub fn extend(&mut self, values: impl IntoIterator<Item = ([usize; 3], T)>) {
+    /// Stages many `(coord, value)` edits at once.
+    pub fn extend(&mut self, values: impl IntoIterator<Item = (Topo::Coord, T)>) {
         for (coord, value) in values {
             self.set(coord, value);
         }
     }
 
-    pub fn sample(&self, coord: [usize; 3]) -> Option<&T> {
-        let chunk_coord = coord.map(|c| c / self.chunk_size);
-        let local_coord = coord.map(|c| c % self.chunk_size);
-        let index = local_coord[0] * self.chunk_size * self.chunk_size
-            + local_coord[1] * self.chunk_size
-            + local_coord[2];
+    /// Returns the staged value at `coord`, or `None` if nothing is staged there.
+    pub fn sample(&self, coord: Topo::Coord) -> Option<&T> {
+        let chunk_coord = Topo::map(coord, |c| c / self.chunk_size);
+        let local_coord = Topo::map(coord, |c| c % self.chunk_size);
+        let index = self.local_index(local_coord);
         self.chunks.get(&chunk_coord)?.get(index)?.as_ref()
     }
 
+    /// Iterates over every coordinate in `region` paired with its staged value
+    /// (`None` where nothing is staged).
     pub fn sample_region(
         &self,
-        region: Range<[usize; 3]>,
-    ) -> impl Iterator<Item = ([usize; 3], Option<&T>)> {
-        (region.start[0]..region.end[0])
-            .flat_map(move |x| (region.start[1]..region.end[1]).map(move |y| [x, y]))
-            .flat_map(move |[x, y]| (region.start[2]..region.end[2]).map(move |z| ([x, y, z])))
-            .map(|coord| (coord, self.sample(coord)))
+        region: Range<Topo::Coord>,
+    ) -> impl Iterator<Item = (Topo::Coord, Option<&T>)> {
+        let mut coords = Vec::new();
+        Topo::for_each_coord(&region, |coord| coords.push(coord));
+        coords
+            .into_iter()
+            .map(move |coord| (coord, self.sample(coord)))
     }
 
-    pub fn is_region_homogeneous(&self, region: Range<[usize; 3]>, default_value: &T) -> Option<T> {
-        let mut value = None;
-        for coord in (region.start[0]..region.end[0])
-            .flat_map(move |x| (region.start[1]..region.end[1]).map(move |y| [x, y]))
-            .flat_map(move |[x, y]| (region.start[2]..region.end[2]).map(move |z| ([x, y, z])))
-        {
+    /// If every coordinate in `region` resolves to
+    /// [homogeneous](CellData::are_homogeneous) data - using `default_value`
+    /// wherever no edit is staged - returns that common value, else `None`.
+    pub fn is_region_homogeneous(
+        &self,
+        region: Range<Topo::Coord>,
+        default_value: &T,
+    ) -> Option<T> {
+        let mut value: Option<&T> = None;
+        let mut homogeneous = true;
+        Topo::for_each_coord(&region, |coord| {
+            if !homogeneous {
+                return;
+            }
             let sample = self.sample(coord).unwrap_or(default_value);
-            if let Some(value) = value {
-                if !sample.are_homogeneous(value) {
-                    return None;
-                }
+            if let Some(value) = value
+                && !sample.are_homogeneous(value)
+            {
+                homogeneous = false;
+                return;
             }
             value = Some(sample);
-        }
-        value.copied()
+        });
+        if homogeneous { value.copied() } else { None }
     }
 
-    pub fn apply(self, grid: &Grid<T>) -> Grid<T> {
+    /// Applies all staged edits to `grid`, returning the resulting new grid.
+    /// The input grid is left unchanged.
+    pub fn apply(self, grid: &Grid<T, Topo>) -> Grid<T, Topo> {
         Transformer::new(&self, grid).execute()
     }
 }
 
-impl<T: CellData> Quantizer for Changes<T> {
+impl<T: CellData, Topo: Topology> Quantizer for Changes<T, Topo> {
     type CellData = T;
+    type Topology = Topo;
 
-    fn quantize(&self, mut context: CellContext<Self::CellData>) -> Address {
+    fn quantize(&self, mut context: CellContext<Self::CellData, Self::Topology>) -> Address {
         if let Some(value) = self.is_region_homogeneous(context.region.clone(), context.cell_data) {
             context.emitter.emit_leaf(value)
         } else {
-            let children = context.subdivide_region().map(|subregion| {
-                let context = unsafe { context.subregion(&subregion) };
-                self.quantize(context)
-            });
+            let children = context.subdivide(|ctx| self.quantize(ctx));
             context.emitter.emit_branch(children)
         }
     }
@@ -125,7 +153,7 @@ impl<T: CellData> Quantizer for Changes<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::{Grid, GridConfig, GridPreviewCell};
+    use crate::grid::{Grid3d, GridConfig, GridPreviewCell};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct Data(pub i32);
@@ -142,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_changes() {
-        let grid = Grid::new(
+        let grid = Grid3d::new(
             GridConfig {
                 chunks_num: [1, 1, 1],
                 chunk_max_depth: 2,
@@ -198,21 +226,9 @@ mod tests {
         );
         assert_eq!(
             grid.preview(),
-            [GridPreviewCell::Branch(
-                [
-                    GridPreviewCell::Branch(
-                        [
-                            GridPreviewCell::Leaf(Data(42)),
-                            GridPreviewCell::Leaf(Data(0)),
-                            GridPreviewCell::Leaf(Data(0)),
-                            GridPreviewCell::Leaf(Data(0)),
-                            GridPreviewCell::Leaf(Data(0)),
-                            GridPreviewCell::Leaf(Data(0)),
-                            GridPreviewCell::Leaf(Data(0)),
-                            GridPreviewCell::Leaf(Data(0))
-                        ]
-                        .into()
-                    ),
+            [GridPreviewCell::Branch(vec![
+                GridPreviewCell::Branch(vec![
+                    GridPreviewCell::Leaf(Data(42)),
                     GridPreviewCell::Leaf(Data(0)),
                     GridPreviewCell::Leaf(Data(0)),
                     GridPreviewCell::Leaf(Data(0)),
@@ -220,9 +236,15 @@ mod tests {
                     GridPreviewCell::Leaf(Data(0)),
                     GridPreviewCell::Leaf(Data(0)),
                     GridPreviewCell::Leaf(Data(0))
-                ]
-                .into()
-            )]
+                ]),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0))
+            ])]
         );
 
         let mut changes = Changes::new(2);
@@ -246,19 +268,16 @@ mod tests {
         );
         assert_eq!(
             grid.preview(),
-            [GridPreviewCell::Branch(
-                [
-                    GridPreviewCell::Leaf(Data(42)),
-                    GridPreviewCell::Leaf(Data(0)),
-                    GridPreviewCell::Leaf(Data(0)),
-                    GridPreviewCell::Leaf(Data(0)),
-                    GridPreviewCell::Leaf(Data(0)),
-                    GridPreviewCell::Leaf(Data(0)),
-                    GridPreviewCell::Leaf(Data(0)),
-                    GridPreviewCell::Leaf(Data(0))
-                ]
-                .into()
-            )]
+            [GridPreviewCell::Branch(vec![
+                GridPreviewCell::Leaf(Data(42)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0))
+            ])]
         );
 
         let mut changes = Changes::new(2);
@@ -282,19 +301,16 @@ mod tests {
         );
         assert_eq!(
             grid.preview(),
-            [GridPreviewCell::Branch(
-                [
-                    GridPreviewCell::Leaf(Data(42)),
-                    GridPreviewCell::Leaf(Data(42)),
-                    GridPreviewCell::Leaf(Data(42)),
-                    GridPreviewCell::Leaf(Data(42)),
-                    GridPreviewCell::Leaf(Data(0)),
-                    GridPreviewCell::Leaf(Data(0)),
-                    GridPreviewCell::Leaf(Data(0)),
-                    GridPreviewCell::Leaf(Data(0))
-                ]
-                .into()
-            )]
+            [GridPreviewCell::Branch(vec![
+                GridPreviewCell::Leaf(Data(42)),
+                GridPreviewCell::Leaf(Data(42)),
+                GridPreviewCell::Leaf(Data(42)),
+                GridPreviewCell::Leaf(Data(42)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0)),
+                GridPreviewCell::Leaf(Data(0))
+            ])]
         );
 
         let mut changes = Changes::new(2);

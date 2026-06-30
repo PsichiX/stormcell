@@ -1,31 +1,35 @@
 use crate::{
     allocator::Address,
-    grid::CellData,
     quantizer::{CellContext, Quantizer},
 };
 
-pub struct KernelQuantizer<Q: Quantizer<CellData = T>, T: CellData> {
+/// Adapter that forces the wrapped quantizer to run at the *finest* resolution.
+///
+/// It recursively subdivides every cell down to size `1` before delegating to
+/// the inner quantizer, re-merging homogeneous results on the way back up. Use
+/// it for rules that must see individual unit cells (e.g. per-cell stencils)
+/// regardless of how coarse the source grid is.
+pub struct KernelQuantizer<Q> {
+    /// The inner per-cell quantizer.
     pub quantizer: Q,
 }
 
-impl<Q: Quantizer<CellData = T>, T: CellData> Quantizer for KernelQuantizer<Q, T> {
-    type CellData = T;
+impl<Q: Quantizer> Quantizer for KernelQuantizer<Q> {
+    type CellData = Q::CellData;
+    type Topology = Q::Topology;
 
-    fn quantize(&self, mut context: CellContext<Self::CellData>) -> Address {
+    fn quantize(&self, mut context: CellContext<Self::CellData, Self::Topology>) -> Address {
         if context.cell_size <= 1 {
             self.quantizer.quantize(context)
         } else {
-            let children = context.subdivide_region().map(|subregion| {
-                let context = unsafe { context.subregion(&subregion) };
-                self.quantize(context)
-            });
+            let children = context.subdivide(|ctx| self.quantize(ctx));
             context
                 .emitter
                 .emit_branch_possibly_merged(children, |cells| self.quantizer.merge(cells))
         }
     }
 
-    fn merge(&self, cells: [&Self::CellData; 8]) -> Self::CellData {
+    fn merge(&self, cells: &[&Self::CellData]) -> Self::CellData {
         self.quantizer.merge(cells)
     }
 }
@@ -35,8 +39,9 @@ mod tests {
     use super::*;
     use crate::{
         changes::Changes,
-        grid::{Grid, GridConfig},
+        grid::{CellData, Grid3d, GridConfig},
         pipeline::Transformer,
+        topology::Topology3d,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,8 +63,9 @@ mod tests {
 
     impl Quantizer for Diffusion {
         type CellData = Temperature;
+        type Topology = Topology3d;
 
-        fn quantize(&self, context: CellContext<Self::CellData>) -> Address {
+        fn quantize(&self, context: CellContext<Self::CellData, Self::Topology>) -> Address {
             let grid_size = context.sampler.grid_size();
 
             let cx = context.region.start[0];
@@ -92,7 +98,7 @@ mod tests {
             quantizer: Diffusion { rate: 0.1 },
         };
 
-        let mut grid = Grid::new(
+        let mut grid = Grid3d::new(
             GridConfig {
                 chunk_max_depth: 2,
                 sampler_cache_limit: Some(64),
