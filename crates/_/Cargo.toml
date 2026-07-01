@@ -1,6 +1,6 @@
 [package]
 name = "stormcell"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Patryk 'PsichiX' Budzynski <psichix@gmail.com>"]
 description = "Adaptive Resolution Grid processing for simulations"
@@ -11,3 +11,6 @@ documentation = "https://docs.rs/stormcell"
 readme = "../../README.md"
 
 [dependencies]
+
+[dev-dependencies]
+noise = "0.9"

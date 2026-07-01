@@ -336,6 +336,33 @@ impl<T: CellData, Topo: Topology> GridFlat<T, Topo> {
     }
 }
 
+impl<T: CellData> GridFlat<T, Topology2d> {
+    /// Reshapes the flat buffer into nested `[y][x]` vectors (2D only).
+    #[inline]
+    pub fn into_2d(self) -> Vec<Vec<T>> {
+        let mut result = Vec::with_capacity(self.size[1]);
+        for y in 0..self.size[1] {
+            let start = y * self.size[0];
+            let end = start + self.size[0];
+            result.push(self.fields[start..end].to_vec());
+        }
+        result
+    }
+
+    /// Like [`into_2d`](GridFlat::into_2d) but maps each value through `f` while
+    /// reshaping (2D only).
+    #[inline]
+    pub fn map_into_2d<U, F: Fn(&T) -> U>(self, f: &F) -> Vec<Vec<U>> {
+        let mut result = Vec::with_capacity(self.size[1]);
+        for y in 0..self.size[1] {
+            let start = y * self.size[0];
+            let end = start + self.size[0];
+            result.push(self.fields[start..end].iter().map(f).collect());
+        }
+        result
+    }
+}
+
 impl<T: CellData> GridFlat<T, Topology3d> {
     /// Reshapes the flat buffer into nested `[z][y][x]` vectors (3D only).
     #[inline]

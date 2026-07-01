@@ -24,8 +24,8 @@ checks:
   just test
   # just miri
 
-example:
-  cargo run --example heat_diffusion_2d --manifest-path ./crates/_/Cargo.toml
+example NAME="heat_diffusion_2d":
+  cargo run --example {{NAME}} --manifest-path ./crates/_/Cargo.toml
 
 clean:
   find . -name target -type d -exec rm -r {} +
